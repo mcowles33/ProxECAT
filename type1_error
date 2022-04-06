@@ -1,1 +1,231 @@
+## load libraries
+library(data.table)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(proxecat)
 
+## define parameters
+nsim = 100 # number of simulation replicates
+rep = 100 + seq(1,100) # replicate number
+
+## read in the sample file for all replicates 
+dir = "~/Masters/simulations/"
+sample = read.table(paste0(dir, "chr19.block37.NFE.controls.sample"), header=T) %>% filter(ID_1!=0) #keep all ids not equal to 0
+
+## create empty vectors to store the p-values from each replicate
+prox.p = proxlog.p = proxpoisc.p = proxpoisf.p = proxpoisint.p = proxpoisfun.p = proxpoissyn.p = c()
+
+## set a seed to replicate results
+set.seed(25)
+
+## loop through the simulation replicates
+for (i in rep){
+  
+  ## read in legend, MAC, and haplotype files
+  leg = read.table(paste0(dir, "chr19.block37.NFE.sim", i, ".legend"), header=T)
+  count = read.table(paste0(dir, "chr19.block37.NFE.sim", i, ".count.txt")) #counts from leg file 
+  haps = read.table(gzfile(paste0(dir, "chr19.block37.NFE.sim", i, ".controls.haps.gz")))
+  
+  ## sample file per replicate
+  sample2 = sample
+  
+  ## randomly designate cases/controls
+  # 0 = internal control, 1 = case, 2 = external control, 3 = external control
+  cases = sample(1:nrow(sample2), 1000)
+  sample2$pheno[cases] = 1
+  ext.controls = sample(which(sample2$pheno==0), 10000)   
+  sample2$pheno[ext.controls] = 2
+  ext.controls2 = sample(which(sample2$pheno==0), 10000)   
+  sample2$pheno[ext.controls2] = 3
+  int.controls = which(sample2$pheno==0)
+  
+  ## create a genotype matrix
+  geno = matrix(0, nrow(haps), (ncol(haps)/2))
+  
+  ## sum up the number of alleles in adjacent haplotypes (2 haplotypes per person)
+  for (j in 1:(ncol(haps)/2)){
+    geno[,j] = haps[,2*j] + haps[,2*j-1]
+  }
+  geno = as.data.frame(geno)
+  
+  ## remove the second set of external control samples
+  geno2 = geno %>% select(!paste0("V", ext.controls2))
+  
+  ## identify/remove the common variants
+  maf = rowSums(geno2)/(2*ncol(geno2)) # minor allele count (MAC) / total # of alleles (2*N)
+  common = which(maf>0.01) # variants with a minor allele frequency (MAF) > 1%
+  
+  ## add annotations and counts from the legend file to the genotype matrix
+  geno.prox = cbind(leg[-common, c("gene", "fun")], geno2[-common,])
+  
+  ## add variant ID from the legend file (for Poisson)
+  geno.prox.id = cbind(leg[-common, c("id","gene", "fun")], geno2[-common,])
+  
+  ## remove variants that are not found in neither case or control samples
+  geno.prox.var = geno.prox.id[rowSums(geno.prox.id[,-c(1:3)])>0,]
+  
+  ## randomly chose 1,000 controls from the 12,000 total controls samples (for Poisson)
+  con = sample(geno.prox.var[,paste0('V',c(ext.controls,int.controls))],1000)
+  
+  ## create a dataframe with sum of alleles for each variant (for Poisson)
+  condf = rowSums(con) #use when running Poisson for 1,000 cases/1,000 controls
+  controldf = rowSums(geno.prox.var[,paste0('V',c(ext.controls,int.controls))])
+  casedf = rowSums(geno.prox.var[,paste0('V', cases)])
+  case.var = cbind(casedf,geno.prox.var[c('id','gene','fun')])
+  control.var = cbind(controldf,geno.prox.var[c('id','gene','fun')]) #replace controldf w/ condf when running Poisson with 1,000 cases/1,000 controls
+  case.var$case <- 'case'
+  control.var$case <- 'control'
+  var = rbind(case.var %>% rename(allelecount = casedf),control.var %>% rename(allelecount = controldf)) #replace controldf w/ condf when running Poisson with 1,000 cases/1,000 controls
+  
+  ## convert all 0 counts to NAs (makes next step faster)
+  geno.prox.na = na_if(geno.prox, "0")
+  
+  ## create a dataframe with a line for each variant instead of just counts (for logistic)
+  data = pivot_longer(geno.prox.na, cols=names(geno2), names_to=c("name"), values_to="count", values_drop_na=T)
+  
+  ## ensure individuals with two copies of the variant are listed twice
+  data2 = data %>% filter(count==2)
+  data.all = rbind(data, data2) %>% select(-count)
+  
+  ## add case/control status and functional group info
+  data.all$case = as.factor(ifelse(data.all$name %in% paste0("V", cases), "case", "control"))
+  data.all$group = as.factor(ifelse(data.all$name %in% paste0("V", ext.controls), "ext", "int"))
+  data.all$fun = as.factor(data.all$fun)
+  
+  ## count the number of alleles per gene per status (case/control & fun/syn)
+  counts = data.all %>% count(gene, case, fun)
+  counts.wide = tidyr::pivot_wider(counts, names_from=c(case, fun), values_from=n,
+                                   values_fill=0, names_sep=".")
+  ## call proxECAT
+  prox = proxecat(counts.wide$case.fun, counts.wide$case.syn, counts.wide$control.fun, counts.wide$control.syn)
+  
+  ## store proxECAT p-values
+  prox.p = rbind(prox.p, prox$p.value)
+  
+  ## call regression models once per gene
+  proxlog = proxpoisc = proxpoisf = proxpoisint = proxpoisfun = proxpoissyn = c()
+  
+  genes = levels(droplevels(as.factor(leg$gene)))
+  for (g in 1:length(genes)){ # loop through the genes
+    
+    ## subset the data by gene
+    temp = data.all %>% filter(gene==genes[g])
+    
+    ## return NA if there are no minor alleles in the internal samples or cases
+    if (summary(temp$group)[2]==0 | summary(temp$case)[1]==0){
+      
+      pvalue = NA
+      
+    } else {
+      
+      ## fit the logistic model
+      glm.log = glm(fun ~ case + group, data=temp, family="binomial") 
+      
+      ## save the p-value for case/control status
+      pvalue = summary(glm.log)$coefficients[2,4]
+      
+    }
+    
+    ## subset the data by gene
+    temp2 = var %>% filter(gene==genes[g])
+    
+    ## return NA if there is only one variable for functionality and case status
+    if (length(unique(temp2$fun))==1 | length(unique(temp2$case))==1) {
+      
+      pvaluepoisc = pvaluepoisf = pvaluepoisint = NA 
+      
+    } else {
+      
+      ## fit Poisson general Poisson model
+      # glm.pois <-glm(formula = allelecount ~ case + fun, data = temp2, family = poisson) # w/out interaction 
+      glm.pois <-glm(formula = allelecount ~ case + fun + (case*fun), data = temp2, family = poisson) # w/ interaction
+    
+      ## save p-value for case/control variable
+      pvaluepoisc = summary(glm.pois)$coefficients[2,4]
+    
+      ## save the p-value for fun/syn variable
+      pvaluepoisf = summary(glm.pois)$coefficients[3,4]
+      
+      ## save the p-value for interaction variable
+      pvaluepoisint = summary(glm.pois)$coefficients[4,4]
+    }
+    
+    ## subset the data by functionality
+    temp2fun = filter(temp2, !(fun %in% c("syn")))
+    temp2syn = filter(temp2, !(fun %in% c("fun")))
+    
+    ## return NA if there is only one variable for functionality and case status
+    '%notin%' <- Negate('%in%') 
+    if ('fun' %notin% temp2$fun){
+     
+      pvaluepoisfun = NA
+    
+    } else{
+      
+      ## fit Poisson model for functional variants 
+       glm.poisfun <-glm(formula = allelecount ~ case, data = temp2fun, family = poisson)
+       
+      ## save the p-value for case/control status
+       pvaluepoisfun = summary(glm.poisfun)$coefficients[2,4] 
+    }
+    
+    ## return NA if there is only one variable for functionality and case status
+    if ('syn' %notin% temp2$fun){ 
+      
+      pvaluepoissyn = NA
+      
+    } else {
+      
+      ## fit Poisson model for synonymous variants
+      glm.poissyn<-glm(formula = allelecount ~ case, data = temp2syn, family = poisson)
+      
+      ## save the p-value for case/control status
+      pvaluepoissyn = summary(glm.poissyn)$coefficients[2,4]
+    }
+  
+    proxlog = c(proxlog, pvalue)
+    proxpoisc = c(proxpoisc, pvaluepoisc)
+    proxpoisf = c(proxpoisf, pvaluepoisf)
+    proxpoisint = c(proxpoisint, pvaluepoisint)
+    proxpoisfun = c(proxpoisfun, pvaluepoisfun)
+    proxpoissyn = c(proxpoissyn, pvaluepoissyn)
+  }
+    
+  ## store the logistic/Poisson p-values
+  proxlog.p = rbind(proxlog.p, proxlog) 
+  proxpoisc.p = rbind(proxpoisc.p, proxpoisc)
+  proxpoisf.p = rbind(proxpoisf.p, proxpoisf)
+  proxpoisint.p = rbind(proxpoisint.p, proxpoisint)
+  proxpoisfun.p = rbind(proxpoisfun.p, proxpoisfun)
+  proxpoissyn.p = rbind(proxpoissyn.p, proxpoissyn)
+    
+  print(i)
+}
+
+## rename columns by gene
+colnames(prox.p) = colnames(proxlog.p) = colnames(proxpoisc.p) = colnames(proxpoisf.p) = colnames(proxpoisint.p) = colnames(proxpoisfun.p) = colnames(proxpoissyn.p) = genes  
+
+## define function for calculating power
+power <- function(values, alpha=0.05){
+  values2 = values[!is.na(values)]
+  sig = which(as.numeric(values2) <= alpha)
+  out = length(sig)/length(values2)
+  return(out)
+}
+
+## create data frame with the type 1 error for each method
+(type1 = data.frame(prox = apply(prox.p, 2, power), 
+                    proxlog = apply(proxlog.p, 2, power),
+                    proxpoisc = apply(proxpoisc.p, 2, power),
+                    proxpoisf = apply(proxpoisf.p, 2, power),
+                    proxpoisint = apply(proxpoisint.p, 2, power), 
+                    proxpoisfun = apply(proxpoisfun.p, 2, power),
+                    proxpoissyn = apply(proxpoissyn.p, 2, power)))
+
+## calculate the average type I error over all the genes
+round(colMeans(type1),3)
+
+## output type I error results 
+write.table(type1, paste0(dir, "TypeIError.txt"), quote=F) #rename for each run (total of 3 runs)
+  
